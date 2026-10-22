@@ -1,6 +1,6 @@
 import os
 import re
-from typing import List
+from typing import Dict, List
 from .dynprompt.expander import (
     PromptExpander,
     WILDCARD_TOKEN_RE,
@@ -27,13 +27,13 @@ def _merge_csv(*parts: str) -> str:
                 out.append(chunk)
     return ", ".join(out)
 
-def _collect_mirrors_deep(text: str, base_expander: PromptExpander) -> str:
+def _collect_mirrors_deep(text: str, base_expander: PromptExpander) -> Dict[str, List[str]]:
     """
     Deep mirroring pass with counter-based RNG:
       - Use a fresh expander (same seed/wildcard_dir/variety) so counters start at 0.
       - Collapse braces first (consumes choice counter).
-      - Expand wildcards left-to-right; for any token ending with '-mir', add
-        "all except chosen" (ignore empties) to the bag.
+      - Expand wildcards left-to-right; for any token ending with '-mir', record
+        "all except chosen" (ignore empties) under that token.
       - Replace tokens with their chosen values to permit nested discovery.
     """
     mirror = PromptExpander(
@@ -44,10 +44,11 @@ def _collect_mirrors_deep(text: str, base_expander: PromptExpander) -> str:
 
     # choices first (consumes mirror's choice counter)
     s = mirror.collapse_choices(text or "")
-    bag: List[str] = []
+    bag: Dict[str, List[str]] = {}
 
     # wildcard pass (consumes mirror's wild counter in the same sequence as Positive)
-    while True:
+    # same cap as the positive wildcard pass so self-referencing wildcards can't hang
+    for _ in range(1024):
         m = WILDCARD_TOKEN_RE.search(s)
         if not m:
             break
@@ -66,14 +67,12 @@ def _collect_mirrors_deep(text: str, base_expander: PromptExpander) -> str:
 
         if token.endswith("-mir"):
             others = [o for i, o in enumerate(opts) if i != idx and o.strip()]
-            if others:
-                bag.extend(others)
+            bag.setdefault(token, []).extend(others)
 
         # Replace the token with its chosen text and continue scanning (to handle nesting)
         s = s[:start] + chosen + s[end:]
 
-    # Return as CSV; dedup/merge handled by _merge_csv
-    return ", ".join(bag)
+    return bag
 
 # -------------------- ComfyUI Node --------------------
 
@@ -81,8 +80,9 @@ class DynPromptExpand:
     """
     ComfyUI node:
       - Positive output: expands braces & wildcards normally (pick-one).
-      - Negative output: expands the user's Negative normally (pick-one), then
-        appends deep-mirrored exclusions from ANY __*-mir__ encountered in the
+      - Negative output: expands the user's Negative normally (pick-one), except
+        that an explicit __*-mir__ becomes every option the Positive did NOT pick.
+        Then appends deep-mirrored exclusions from ANY __*-mir__ encountered in the
         Positive (including those nested inside wildcard files). Strict '-mir':
         only '<name>-mir.txt' is consulted; no fallback to '<name>.txt'.
 
@@ -129,13 +129,24 @@ class DynPromptExpand:
         # A) Positive prompt: full expansion (choices -> wildcards -> choices)
         pos_final = expander.expand_prompt(text or "", phase="pos")
 
-        # B) User Negative: expand normally (pick-one semantics; no mirroring here)
-        neg_user_final = expander.expand_prompt(negative or "", phase="pos")
+        # B) Deep mirror: collect exclusions for ANY __*-mir__ appearing during Positive expansion
+        mirrored = _collect_mirrors_deep(text, expander) if (text or "").strip() else {}
 
-        # C) Deep mirror: collect exclusions for ANY __*-mir__ appearing during Positive expansion
+        # C) User Negative: an explicit __*-mir__ becomes the options the Positive did not pick
+        #    (all options if the Positive never used it); everything else expands normally (pick-one)
+        def _mirror_token(m):
+            token = m.group(1)
+            if not token.endswith("-mir"):
+                return m.group(0)
+            if token in mirrored:
+                return ", ".join(mirrored[token])
+            return ", ".join(o for o in expander.read_options_for_token(token) if o.strip())
+
+        neg_user_final = expander.expand_prompt(WILDCARD_TOKEN_RE.sub(_mirror_token, negative or ""), phase="pos")
+
         mirrored_additions = ""
-        if auto_neg_from_mir and (text or "").strip():
-            mirrored_additions = _collect_mirrors_deep(text, expander)
+        if auto_neg_from_mir:
+            mirrored_additions = ", ".join(o for others in mirrored.values() for o in others)
 
         # D) Merge user negative + mirrored exclusions (dedup; preserve order)
         neg_final = _merge_csv(neg_user_final, mirrored_additions)

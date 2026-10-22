@@ -22,10 +22,10 @@ license = {file = "LICENSE"}
 
 
 [project.urls]
-Repository = "https://github.com/KoinnAI/ComfyUI-DynPromptSimplified"
+Repository = "https://github.com/RegulusAlpha/ComfyUI-DynPromptSimplified"
 #  Used by Comfy Registry https://registry.comfy.org
-Documentation = "https://github.com/KoinnAI/ComfyUI-DynPromptSimplified/wiki"
-"Bug Tracker" = "https://github.com/KoinnAI/ComfyUI-DynPromptSimplified/issues"
+Documentation = "https://github.com/RegulusAlpha/ComfyUI-DynPromptSimplified/wiki"
+"Bug Tracker" = "https://github.com/RegulusAlpha/ComfyUI-DynPromptSimplified/issues"
 
 [tool.comfy]
 PublisherId = "koinai"

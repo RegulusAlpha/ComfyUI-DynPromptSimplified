@@ -16,16 +16,17 @@ A minimal **dynamic prompting + mirrored wildcards** node for ComfyUI.
 3. Restart ComfyUI.
 
 ## Node
-**DynPrompt Expand (mirrored wildcards)**
-- Inputs: `text`, `negative`, `seed`, `wildcard_dir`, `auto_neg_from_mir`
+**DynPrompt Expand (deep-mirrored)**
+- Inputs: `text`, `negative`, `seed`, `variety`, `wildcard_dir`, `auto_neg_from_mir`
 - Outputs: expanded `text`, expanded `negative`
 
 ## Node Inputs
-- positive: positive prompt
+- text: positive prompt
 - negative: negative prompt
-- Seed: this is used to determine how the node will select tags
-- allow neg from mir: automatically adds -mir tags to negative prompt without explicitly needing to add it to the negative prompt
-- variety: int between 0-10; creates extra randomness 'lanes' [Variety](#-variety-extra-randomness-lanes)
+- seed: this is used to determine how the node will select tags
+- variety: int between 0-100; creates extra randomness 'lanes' [Variety](#-variety-extra-randomness-lanes)
+- wildcard_dir: folder with your wildcard .txt files; leave blank to use the `wildcards/` folder next to the node
+- auto_neg_from_mir: automatically adds -mir tags to negative prompt without explicitly needing to add it to the negative prompt
 <br>
 Wire the outputs into your usual `CLIP Text Encode` node <br>
 You can preview what the output is with the "preview any" node in utils
@@ -49,6 +50,7 @@ You can preview what the output is with the "preview any" node in utils
 
 - Located in the `wildcards/` directory (configurable).
 - Each line is one possible expansion.
+- Blank lines and lines starting with `#` are ignored.
 - Lines may contain further braces `{}` and wildcard calls.
 
 **Example: `wildcards/hats.txt`**
@@ -100,7 +102,7 @@ Usage:
 - Positive: `portrait, __outfits__`
 - Negative: *(leave blank or put your usual negatives)*
 <br>
-- add node from: add node -> prompt -> DSynPrompt Expand (deep-mirrored)
+- add node from: add node -> prompt -> DynPrompt Expand (deep-mirrored)
 <br>
  <img src="https://raw.githubusercontent.com/RegulusAlpha/ComfyUI-DynPromptSimplified/refs/heads/main/images/2.png" alt="Preview 1" width="500"/>
 <br>
@@ -155,7 +157,7 @@ Negative: lowres, bad anatomy, __hats-mir__
 - `variety` is an extra integer salt to create reproducible “lanes”.
 
 **Expansion Order (Positive)**
-1) **Braces-first pass** (repeat until none left)  
+1) **Braces-first pass** (repeat until none left, up to 1024 blocks)  
    Collapse the left-most non-nested `{…}` using **choice#N**.
 2) **Wildcard pass** (left → right)  
    Replace each `__token__` using **wild#M**:
@@ -169,7 +171,9 @@ Negative: lowres, bad anatomy, __hats-mir__
    Normalize commas/spaces.
 
 **Deep Mirroring (Negative complement)**
-- Your user Negative is expanded **normally** (same algorithm as Positive: braces → wildcards → braces).
+- Your user Negative is expanded **normally** (same algorithm as Positive: braces → wildcards → braces), except:
+  - An explicit `__name-mir__` in the Negative becomes **every option the Positive did not pick** for that token (never the picked one).
+  - If the Positive never used that token, it becomes **all** of its options.
 - If `auto_neg_from_mir` is **ON**, we run a **mirror pass** over the Positive prompt:
   - Re-run the same brace + wildcard passes with the same `(seed, variety)` and counters.
   - For every `__*-mir__` encountered (even if nested inside other wildcards):
@@ -180,9 +184,10 @@ Negative: lowres, bad anatomy, __hats-mir__
 
 **File Semantics**
 - **Single-line files**:
-  - Non-mir: if it’s `{a|b|{c|d}|}`, split by **top-level** `|` (empties kept as `""`).
-  - `*-mir`: if it’s `{a|b|{c|d}}`, **flatten** to leaf options `["a","b","c","d"]` so “all-except-chosen” is well-defined.
+  - Non-mir: if the whole line is one block like `{a|b|{c|d}|}`, split by **top-level** `|` (empties kept as `""`). A line like `{a|b} dress, {c|d}` is one option and its braces are picked normally.
+  - `*-mir`: braces are **flattened** to leaf options (`{a|b|{c|d}}` → `["a","b","c","d"]`, `{red|blue} hat` → `["red hat","blue hat"]`) so “all-except-chosen” is well-defined.
 - **Multi-line files**: each non-empty, non-comment line is an option (lines may contain braces/wildcards).
+  - `*-mir` files whose lines contain braces are flattened the same way, so the Negative gets plain options instead of raw `{…}`.
 - **Path safety**: allows subfolders (`a/b`), dotted names (`style.v1`); blocks traversal (`..`).
 
 **Pseudocode (conceptual)**
@@ -222,37 +227,10 @@ Negative: lowres, bad anatomy, __hats-mir__
 
 ## Notes
 - Missing wildcard files resolve to empty strings.
-- Choice/wildcard expansion is capped to prevent runaway recursion.
-- If `negative` is blank and `auto_neg_from_mir` is ON, the node scans the positive for `__tokens__`
-  and auto-builds a mirrored negative when possible.
+- Expansion is capped to prevent runaway recursion: each brace pass resolves up to 1024 `{…}` blocks and the wildcard pass (including the mirror pass) up to 1024 `__tokens__`. Anything past the cap is left in the prompt as-is.
+- With `auto_neg_from_mir` ON, mirrored exclusions are appended to the negative whether or not you typed a negative.
 
 ## Changelog
+See [CHANGELOG.md](CHANGELOG.md).
 
-### 2025-08-24 — Counter-Based Randomness & “Variety” lanes
-**Why**: fixed tokens could cause prompt to converge.
-
-**What changed**
-- **Decision-only RNG**: Random choices now depend **only** on decision points (each `{…}` block and each `__wildcard__` / `__*-mir__` call), not on surrounding fixed text.  
-  - Internally we hash `(seed, decision_counter[, token], variety)` where counters advance as we hit choices/wildcards left→right.
-  - Adding/removing fixed words, commas, or spacing no longer shifts picks.
-- **Deterministic lanes via `variety`**: New integer input that adds an extra salt.  
-  - Same `(seed, variety, prompt, files)` ⇒ same outputs.  
-  - Sweep `variety = 0,1,2…` to get reproducible alternates without touching seed or prompt.
-- **Deep mirroring (strict)**: `__foo-mir__` contributes mirrored exclusions to Negative even when **nested** inside other wildcards, and **only** reads `foo-mir.txt` (never falls back).
-- **Empty-branch support in `*-mir.txt`**: `{option|}` is honored.  
-  - If Positive picks `option`, Negative adds nothing for that token; if Positive picks the empty branch, Negative adds the non-empty options.
-- **Single-line `*-mir.txt` with nested braces**: `{1|2|{3|4}}` is flattened to leaves so mirroring can compute “all-except-chosen” correctly.
-
-**Behavior notes**
-- Fixed text no longer influences randomness. Only the **number/order** of decision points matters.  
-- Changing decision points (e.g., adding a `{…}` or another `__wildcard__`) will change the sequence of draws—as expected.  
-- Deep mirror uses the same counters as Positive, ensuring the Negative always gets the correct complement.
-
-**Example**
-```text
-Prompt: __color__, {A|B|{C|D}}, __pose-mir__
-Same seed, same variety → same picks (pos & neg)
-Change only fixed words → picks stay identical
-Bump variety (e.g., 0→1) → different, reproducible picks
-```
 License: GPLv3 (same as the original)

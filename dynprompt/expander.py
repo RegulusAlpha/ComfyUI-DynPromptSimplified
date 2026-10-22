@@ -49,31 +49,34 @@ def _split_top_level_alts(s: str) -> List[str]:
     return alts
 
 
+def _matching_brace(s: str, i: int) -> int:
+    """Index of the '}' that closes the '{' at s[i], or -1 if it never closes."""
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == '{':
+            depth += 1
+        elif s[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
 def _flatten_brace_expr(expr: str) -> List[str]:
     """
     Expand a string containing brace expressions (with possible nesting) into all leaf strings.
     Empty branches are preserved as '' when they reduce to nothing.
+    Pieces are not stripped while joining ("{a|b} x" -> "a x"); callers strip the leaves.
     """
     # Find first '{'
     i = expr.find('{')
     if i == -1:
-        return [expr.strip()]
+        return [expr]
 
-    # Find its matching '}'
-    depth = 0
-    j = i
-    while j < len(expr):
-        if expr[j] == '{':
-            depth += 1
-        elif expr[j] == '}':
-            depth -= 1
-            if depth == 0:
-                break
-        j += 1
-
-    if j >= len(expr):
+    j = _matching_brace(expr, i)
+    if j == -1:
         # Malformed braces; return as-is
-        return [expr.strip()]
+        return [expr]
 
     pre = expr[:i]
     inner = expr[i+1:j]
@@ -83,7 +86,7 @@ def _flatten_brace_expr(expr: str) -> List[str]:
     for alt in _split_top_level_alts(inner):
         for alt_exp in _flatten_brace_expr(alt):
             for post_exp in _flatten_brace_expr(post):
-                results.append((pre + alt_exp + post_exp).strip())
+                results.append(pre + alt_exp + post_exp)
     return results
 
 
@@ -176,12 +179,15 @@ class PromptExpander:
 
         Behavior:
           * Multi-line file: each non-empty, non-comment line is one option.
+              - For '-mir' tokens with braces: every line is FLATTENED into leaf
+                options, so "all-except-chosen" never contains raw braces.
           * Single-line without braces: the whole line is one option.
           * Single-line WITH braces:
               - For '-mir' tokens: FLATTEN nested braces into leaf options
                                    (preserve empty leaves as '').
-              - For non-mir tokens: split by TOP-LEVEL '|' into options
-                                    (empty branches kept as '').
+              - For non-mir tokens: if the whole line is one {…} block, split by
+                TOP-LEVEL '|' into options (empty branches kept as ''); otherwise
+                the line is one option and its braces collapse later.
         """
         path = self._normalize_token_to_path(token)
         if not path:
@@ -209,14 +215,18 @@ class PromptExpander:
                     # Deep flatten for -mir so "all-except-chosen" is well-defined over leaves
                     return _dedup_preserve(_flatten_brace_expr(line))
                 else:
-                    # Non-mir: choose among top-level alts (empties allowed)
-                    m = re.fullmatch(r"\{(.*)\}", line)
-                    if m:
-                        return _split_top_level_alts(m.group(1))
-                    # If unmatched, leave as single option
+                    # Non-mir: choose among top-level alts (empties allowed), but only when
+                    # the first '{' closes at the end; "{a|b} x, {c|d}" is a single option
+                    if line.startswith("{") and _matching_brace(line, 0) == len(line) - 1:
+                        return _split_top_level_alts(line[1:-1])
                     return [line]
             # No braces => single option
             return [line]
+
+        # Multi-line -mir file with braces: flatten like the single-line case so the
+        # mirrored Negative gets plain leaves instead of raw "{a|b}" text
+        if token.endswith("-mir") and any("{" in t for t in raw):
+            return _dedup_preserve([leaf for t in raw for leaf in _flatten_brace_expr(t)])
 
         # Multi-line file: return lines as distinct options (braces inside a line
         # are collapsed later by the brace pass).
@@ -252,7 +262,7 @@ class PromptExpander:
         chosen = options[idx]  # may be '' (empty branch)
         return s[:start] + chosen + s[end:]
 
-    def _expand_choices_recursively(self, s: str, limit: int = 64) -> str:
+    def _expand_choices_recursively(self, s: str, limit: int = 1024) -> str:
         for _ in range(limit):
             if not INNER_BRACE_RE.search(s):
                 break
@@ -284,7 +294,7 @@ class PromptExpander:
 
         return s[:start] + core + s[end:]
 
-    def _expand_wildcards_recursively(self, s: str, phase: str, limit: int = 128) -> str:
+    def _expand_wildcards_recursively(self, s: str, phase: str, limit: int = 1024) -> str:
         for _ in range(limit):
             if not WILDCARD_TOKEN_RE.search(s):
                 break
@@ -306,6 +316,6 @@ class PromptExpander:
         # 3) Collapse any braces that came from wildcard lines
         out = self._expand_choices_recursively(out)
         # 4) Cleanup duplicated commas/spaces
-        out = re.sub(r"\s*,\s*,\s*", ", ", out)
+        out = re.sub(r"\s*,(\s*,)+\s*", ", ", out)
         out = re.sub(r"\s{2,}", " ", out).strip().strip(", ")
         return out
